@@ -1,5 +1,5 @@
 # ============================================================
-# BLACK PYRAMID v2010.3 — MULTI-MODE FREQUENCY EDITION
+# BLACK PYRAMID v2010.4 — BTC HIGH-ACCURACY EDITION
 # Institutional Analysis Terminal
 # ============================================================
 
@@ -52,7 +52,7 @@ warnings.filterwarnings("ignore", message=".*Expecting value.*")
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "v2010.3"
+APP_VERSION = "v2010.4"
 
 MODE = "balanced"
 MAX_STRONG_TRADES = 4
@@ -108,6 +108,9 @@ TUNING_N_JOBS = -1
 SL_MIN_DIST_ATR = 0.25
 SL_MAX_DIST_ATR = 1.50
 SL_BUFFER_ATR = 0.20
+
+# بوابة الثقة لقسم BTC (منفصلة عن بوابة الإشارات العامة)
+BTC_CONFIDENCE_GATE = 70.0
 
 ML_FEATURE_NAMES = [
     "structure", "trend", "momentum", "volume", "context",
@@ -224,7 +227,7 @@ def init_state():
         "ml_model": None, "_ccy_strength_cache": {},
         "show_details": False,
         "strong_trade_result": None,
-        "otc_result": None}
+        "btc_result": None}
     for k, v in defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
@@ -972,7 +975,7 @@ def calc_session_vwap(df):
 
 
 # ═══════════════════════════════════════════════════════════
-# SWING DETECTION (real swing prices)
+# SWING DETECTION
 # ═══════════════════════════════════════════════════════════
 
 def find_confirmed_swings(df, order=3):
@@ -2949,198 +2952,137 @@ def render_trade_plan(levels, pair_name, title="Trade Plan", accent="#e6c87c",
 
 
 # ═══════════════════════════════════════════════════════════════
-# ⚡ OTC SHORT-TIMEFRAME HELPERS (5m / 15m / 30m)
+# ₿ BTC HIGH-ACCURACY SIGNAL (15m Primary + 1H Filter + CVD)
 # ═══════════════════════════════════════════════════════════════
 
-def calc_stoch(df, k=14, d=3):
-    ll = df["low"].rolling(k).min()
-    hh = df["high"].rolling(k).max()
-    rng = (hh - ll).replace(0, np.nan)
-    k_line = 100 * (df["close"] - ll) / rng
-    d_line = k_line.rolling(d).mean()
-    return k_line.fillna(50), d_line.fillna(50)
+def calc_cvd(df, period=20):
+    """تراكم دلتا الحجم — يقيس ضغط المشترين/البائعين الحقيقي."""
+    rng = (df["high"] - df["low"]).replace(0, np.nan)
+    delta = ((df["close"] - df["low"]) - (df["high"] - df["close"])) / rng
+    volume_delta = delta.fillna(0) * df["volume"]
+    cvd = volume_delta.cumsum()
+    if len(cvd) < period + 5:
+        return 0.0, 0.0
+    slope = (cvd.iloc[-1] - cvd.iloc[-period]) / max(abs(cvd.iloc[-period]), 1e-9)
+    return safe_float(cvd.iloc[-1], 0.0), safe_float(slope, 0.0)
 
 
-def calc_cci(df, period=20):
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    sma = tp.rolling(period).mean()
-    mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-    return ((tp - sma) / (0.015 * mad.replace(0, np.nan))).fillna(0)
-
-
-def calc_williams_r(df, period=14):
-    hh = df["high"].rolling(period).max()
-    ll = df["low"].rolling(period).min()
-    rng = (hh - ll).replace(0, np.nan)
-    return (-100 * (hh - df["close"]) / rng).fillna(-50)
-
-
-def calc_adx(df, period=14):
-    h = df["high"]; l = df["low"]; c = df["close"]
-    up = h.diff(); dn = -l.diff()
-    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
-    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    tr = pd.concat([h - l, (h - c.shift(1)).abs(),
-                    (l - c.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    pdi = 100 * pd.Series(plus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
-    mdi = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1/period, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    adx = dx.ewm(alpha=1/period, adjust=False).mean()
-    return pdi.fillna(0), mdi.fillna(0), adx.fillna(0)
-
-
-def otc_direction_signal(df):
-    """Computes CALL/PUT signal + confluence breakdown for one timeframe."""
-    if df is None or len(df) < 50:
+def btc_signal_15m(df_15m, df_1h):
+    """
+    إشارة اتجاه للبيتكوين عالية الدقة.
+    - 15m تحدد الاتجاه (EMA + CVD + MACD + RSI)
+    - 1H يجب أن توافق (لا ندخل ضد الاتجاه الأكبر)
+    - بوابة ثقة: إذا لم تصل 70% -> WAIT (لا إشارة)
+    """
+    if df_15m is None or len(df_15m) < 80:
         return None
-    try:
-        x = df.copy()
-        x["ema5"] = x["close"].ewm(span=5, adjust=False).mean()
-        x["ema13"] = x["close"].ewm(span=13, adjust=False).mean()
-        x["ema21"] = x["close"].ewm(span=21, adjust=False).mean()
-        x["ema50"] = x["close"].ewm(span=50, adjust=False).mean()
-        x["rsi"] = calc_rsi(x["close"], 14)
-        x["macd"], x["macd_sig"], x["macd_hist"] = calc_macd(x["close"], 12, 26, 9)
-        x["bb_up"], x["bb_mid"], x["bb_lo"] = calc_bollinger(x["close"], 20, 2.0)
-        x["stoch_k"], x["stoch_d"] = calc_stoch(x, 14, 3)
-        x["wr"] = calc_williams_r(x, 14)
-        x["pdi"], x["mdi"], x["adx"] = calc_adx(x, 14)
-        x["atr"] = calc_atr(x, 14)
 
-        l = x.iloc[-1]; p = x.iloc[-2]
-        call = 0.0; put = 0.0; reasons = []
+    x = df_15m.copy()
+    x["ema9"] = x["close"].ewm(span=9, adjust=False).mean()
+    x["ema21"] = x["close"].ewm(span=21, adjust=False).mean()
+    x["ema50"] = x["close"].ewm(span=50, adjust=False).mean()
+    x["rsi"] = calc_rsi(x["close"], 14)
+    x["macd"], x["macd_sig"], x["macd_hist"] = calc_macd(x["close"], 12, 26, 9)
+    x["atr"] = calc_atr(x, 14)
+    x["cvd"], x["cvd_slope"] = calc_cvd(x)
+    atr_ma = x["atr"].rolling(50).mean()
+    x["atr_ratio"] = (x["atr"] / atr_ma.replace(0, np.nan)).fillna(1.0)
 
-        # 1) EMA stack
-        if l["ema5"] > l["ema13"] > l["ema21"]:
-            call += 18; reasons.append("EMA stack صاعد")
-        elif l["ema5"] < l["ema13"] < l["ema21"]:
-            put += 18; reasons.append("EMA stack هابط")
-        if l["close"] > l["ema50"]: call += 8
-        elif l["close"] < l["ema50"]: put += 8
+    l = x.iloc[-1]; p = x.iloc[-2]
+    call = 0.0; put = 0.0; reasons = []
 
-        # 2) EMA cross recency
-        cross_up = (p["ema5"] <= p["ema13"]) and (l["ema5"] > l["ema13"])
-        cross_dn = (p["ema5"] >= p["ema13"]) and (l["ema5"] < l["ema13"])
-        if cross_up: call += 15; reasons.append("تقاطع EMA5/13 صاعد")
-        if cross_dn: put += 15; reasons.append("تقاطع EMA5/13 هابط")
+    # 1) EMA Stack
+    if l["ema9"] > l["ema21"] > l["ema50"]:
+        call += 20; reasons.append("EMA 9>21>50 صاعد (15m)")
+    elif l["ema9"] < l["ema21"] < l["ema50"]:
+        put += 20; reasons.append("EMA 9<21<50 هابط (15m)")
 
-        # 3) RSI
-        r = safe_float(l["rsi"], 50)
-        if r > 55: call += 10
-        elif r < 45: put += 10
-        if r >= 70: put += 6; reasons.append("RSI Overbought")
-        if r <= 30: call += 6; reasons.append("RSI Oversold")
+    # 2) EMA Cross حديث
+    if p["ema9"] <= p["ema21"] and l["ema9"] > l["ema21"]:
+        call += 12; reasons.append("تقاطع EMA9/21 صاعد")
+    if p["ema9"] >= p["ema21"] and l["ema9"] < l["ema21"]:
+        put += 12; reasons.append("تقاطع EMA9/21 هابط")
 
-        # 4) MACD
-        if l["macd"] > l["macd_sig"] and l["macd_hist"] > 0:
-            call += 12; reasons.append("MACD صاعد")
-        elif l["macd"] < l["macd_sig"] and l["macd_hist"] < 0:
-            put += 12; reasons.append("MACD هابط")
-        if (p["macd"] <= p["macd_sig"]) and (l["macd"] > l["macd_sig"]):
-            call += 10; reasons.append("تقاطع MACD صاعد")
-        if (p["macd"] >= p["macd_sig"]) and (l["macd"] < l["macd_sig"]):
-            put += 10; reasons.append("تقاطع MACD هابط")
+    # 3) MACD
+    if l["macd_hist"] > 0 and l["macd"] > l["macd_sig"]:
+        call += 12; reasons.append("MACD صاعد (15m)")
+    elif l["macd_hist"] < 0 and l["macd"] < l["macd_sig"]:
+        put += 12; reasons.append("MACD هابط (15m)")
 
-        # 5) Stochastic
-        sk = safe_float(l["stoch_k"], 50); sd = safe_float(l["stoch_d"], 50)
-        if sk > sd and sk < 80: call += 8
-        elif sk < sd and sk > 20: put += 8
-        if sk < 20 and sk > sd: call += 6; reasons.append("Stoch Oversold")
-        if sk > 80 and sk < sd: put += 6; reasons.append("Stoch Overbought")
+    # 4) CVD
+    if l["cvd_slope"] > 0.05:
+        call += 15; reasons.append(f"CVD صاعد ({l['cvd_slope']:.2f})")
+    elif l["cvd_slope"] < -0.05:
+        put += 15; reasons.append(f"CVD هابط ({l['cvd_slope']:.2f})")
 
-        # 6) Bollinger
-        bu = safe_float(l["bb_up"], 0); bl = safe_float(l["bb_lo"], 0)
-        price = safe_float(l["close"], 0)
-        if bu > bl > 0:
-            pos = (price - bl) / (bu - bl)
-            if pos > 0.9: put += 8; reasons.append("Bollinger Overbought")
-            elif pos < 0.1: call += 8; reasons.append("Bollinger Oversold")
+    # 5) RSI كتأكيد فقط
+    r = safe_float(l["rsi"], 50)
+    if 52 <= r <= 68: call += 8; reasons.append(f"RSI صاعد ({r:.0f})")
+    elif 32 <= r <= 48: put += 8; reasons.append(f"RSI هابط ({r:.0f})")
+    if r > 72 and call > put: reasons.append("RSI مشبع — لا نعكس في ترند قوي")
+    if r < 28 and put > call: reasons.append("RSI مشبع بيع — لا نعكس في ترند قوي")
 
-        # 7) Williams %R
-        wr = safe_float(l["wr"], -50)
-        if wr > -20: put += 6
-        elif wr < -80: call += 6
+    # 6) ATR Ratio
+    if l["atr_ratio"] > 2.0:
+        reasons.append("تقلب مفرط — تخفيض الثقة")
+        call *= 0.85; put *= 0.85
 
-        # 8) ADX trend strength
-        adx = safe_float(l["adx"], 0)
-        pdi = safe_float(l["pdi"], 0); mdi = safe_float(l["mdi"], 0)
-        if adx > 25:
-            if pdi > mdi: call += 10; reasons.append(f"ADX قوي ({adx:.0f})")
-            elif mdi > pdi: put += 10; reasons.append(f"ADX قوي ({adx:.0f})")
+    # 7) فلتر 1H
+    h1_bias = "NEUTRAL"
+    if df_1h is not None and len(df_1h) >= 60:
+        h = df_1h.copy()
+        h["ema21"] = h["close"].ewm(span=21, adjust=False).mean()
+        h["ema50"] = h["close"].ewm(span=50, adjust=False).mean()
+        hl = h.iloc[-1]
+        if hl["ema21"] > hl["ema50"]:
+            h1_bias = "BULLISH"
+        elif hl["ema21"] < hl["ema50"]:
+            h1_bias = "BEARISH"
 
-        # 9) Candle strength
-        body = abs(l["close"] - l["open"])
-        rng = max(l["high"] - l["low"], 1e-9)
-        if l["close"] > l["open"] and body/rng > 0.5: call += 6
-        elif l["close"] < l["open"] and body/rng > 0.5: put += 6
+    if h1_bias == "BULLISH" and put > call:
+        put = max(0, put - 25)
+        reasons.append("1H صاعد — تم كبح إشارة PUT")
+    if h1_bias == "BEARISH" and call > put:
+        call = max(0, call - 25)
+        reasons.append("1H هابط — تم كبح إشارة CALL")
+    if h1_bias == "BULLISH" and call > put:
+        call += 10; reasons.append("1H يدعم CALL")
+    if h1_bias == "BEARISH" and put > call:
+        put += 10; reasons.append("1H يدعم PUT")
 
-        # 10) Volume confirmation
-        va = x["volume"].rolling(20).mean().iloc[-1]
-        if va and va > 0:
-            vr = l["volume"] / va
-            if vr > 1.3:
-                if l["close"] > l["open"]: call += 5
-                else: put += 5
-
-        total = call + put
-        if total <= 0:
-            return {"signal": "WAIT", "confidence": 0, "reasons": [],
-                    "call": 0, "put": 0, "adx": 0, "rsi": 50, "atr": 0,
-                    "last_close": 0}
-        edge = abs(call - put) / total
-        conf = clamp(50 + edge * 55 + max(0, abs(call - put) - 15) * 0.5, 50, 92)
-        direction = "CALL" if call > put else "PUT" if put > call else "WAIT"
-        if edge < 0.10: direction = "WAIT"
-        return {"signal": direction, "confidence": conf,
-                "call": round(call, 1), "put": round(put, 1),
-                "reasons": reasons, "adx": adx, "rsi": r,
-                "atr": safe_float(l["atr"], 0),
+    total = call + put
+    if total <= 0:
+        return {"signal": "WAIT", "confidence": 0, "reasons": reasons,
+                "call": 0, "put": 0, "h1_bias": h1_bias, "rsi": r,
+                "atr_ratio": safe_float(l["atr_ratio"], 1.0), "cvd_slope": 0,
                 "last_close": safe_float(l["close"], 0)}
-    except Exception:
-        return None
+
+    edge = abs(call - put) / total
+    conf = clamp(50 + edge * 50 + min(abs(call - put), 30) * 0.4, 50, 92)
+    direction = "CALL" if call > put else "PUT" if put > call else "WAIT"
+
+    # بوابة الثقة
+    if edge < 0.12 or conf < BTC_CONFIDENCE_GATE:
+        direction = "WAIT"
+
+    return {"signal": direction, "confidence": conf,
+            "call": round(call, 1), "put": round(put, 1),
+            "reasons": reasons, "h1_bias": h1_bias,
+            "rsi": r, "atr_ratio": safe_float(l["atr_ratio"], 1.0),
+            "cvd_slope": safe_float(l["cvd_slope"], 0.0),
+            "last_close": safe_float(l["close"], 0)}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def get_otc_proxy_data(symbol, tf):
-    """OTC is broker-specific — uses real underlying prices as direction proxy."""
+def get_btc_data(tf):
+    """جلب بيانات BTCUSD على الفريم المطلوب."""
     try:
-        period_map = {"5m": "5d", "15m": "5d", "30m": "5d"}
-        yf_sym = sanitize_yf_symbol(symbol)
-        df = yf.download(yf_sym, period=period_map.get(tf, "5d"),
-                         interval=tf, auto_adjust=False,
-                         progress=False, threads=False)
+        period = "5d" if tf in ("15m", "30m", "5m") else "1mo"
+        df = yf.download("BTC-USD", period=period, interval=tf,
+                         auto_adjust=False, progress=False, threads=False)
         return normalize_ohlcv(df, min_rows=50)
     except Exception:
         return None
-
-
-def combine_otc_signals(signals):
-    """signals: dict {"5m": sig, "15m": sig, "30m": sig}"""
-    if not signals: return None
-    valid = {tf: s for tf, s in signals.items()
-             if s and s.get("signal") in ("CALL", "PUT")}
-    if not valid:
-        return {"signal": "WAIT", "confidence": 0,
-                "call_score": 0, "put_score": 0,
-                "votes_call": 0, "votes_put": 0, "details": {}}
-    weights = {"5m": 0.25, "15m": 0.35, "30m": 0.40}
-    call = sum(weights[tf] * s["call"]
-               for tf, s in valid.items() if s["signal"] == "CALL")
-    put = sum(weights[tf] * s["put"]
-              for tf, s in valid.items() if s["signal"] == "PUT")
-    votes = sum(1 for s in valid.values() if s["signal"] == "CALL")
-    votes_put = sum(1 for s in valid.values() if s["signal"] == "PUT")
-    if votes >= 2: direction = "CALL"
-    elif votes_put >= 2: direction = "PUT"
-    else: direction = "CALL" if call > put else "PUT" if put > call else "WAIT"
-    avg_conf = float(np.mean([s["confidence"] for s in valid.values()]))
-    agree_bonus = 12 if (votes >= 2 or votes_put >= 2) else 0
-    conf = clamp(avg_conf + agree_bonus, 50, 95)
-    return {"signal": direction, "confidence": conf,
-            "call_score": round(call, 1), "put_score": round(put, 1),
-            "votes_call": votes, "votes_put": votes_put,
-            "details": valid}
 
 
 # ============================================================
@@ -3272,7 +3214,7 @@ with hl:
                 Institutional Analysis Terminal
                 <span class="hero-badge">{APP_VERSION}</span>
                 <span class="hero-badge-mode">{MODE.upper()}</span>
-                <span class="hero-badge-gate">GATE ≥ {MIN_EMIT_CONFIDENCE:.0f}%</span>
+                <span class="hero-badge-gate">BTC GATE ≥ {BTC_CONFIDENCE_GATE:.0f}%</span>
             </div>
         </div>""", unsafe_allow_html=True)
     else:
@@ -3283,7 +3225,7 @@ with hl:
                 Institutional Analysis Terminal
                 <span class="hero-badge">{APP_VERSION}</span>
                 <span class="hero-badge-mode">{MODE.upper()}</span>
-                <span class="hero-badge-gate">GATE ≥ {MIN_EMIT_CONFIDENCE:.0f}%</span>
+                <span class="hero-badge-gate">BTC GATE ≥ {BTC_CONFIDENCE_GATE:.0f}%</span>
             </div>
         </div>""", unsafe_allow_html=True)
 
@@ -3514,128 +3456,73 @@ else:
 
 
 # ═══════════════════════════════════════════════
-# ⚡ OTC SECTION (5m / 15m / 30m)
+# ₿ BTC HIGH-ACCURACY SIGNAL SECTION
 # ═══════════════════════════════════════════════
-st.markdown('<div class="section-title">⚡ إشارات OTC — 5م / 15م / 30م '
-            '<span>Short-TF Direction (Proxy)</span></div>',
+st.markdown('<div class="section-title">₿ إشارة البيتكوين عالية الدقة '
+            '<span>15m Primary · 1H Filter · CVD</span></div>',
             unsafe_allow_html=True)
 
-st.warning("⚠️ **OTC ليس له مصدر بيانات عام.** هذا القسم يحلل **الزوج الأصلي** "
-           "على فريمات 5/15/30 دقيقة كـ **Proxy للاتجاه**. سعر البوكر قد يختلف "
-           "قليلاً — استخدم الإشارة للاتجاه فقط، والدخول على سعر البوكر.")
+st.caption(f"الفريم الرئيسي **15 دقيقة** (الأفضل تاريخيًا للبيتكوين) مع فلتر **1H** "
+           f"وميزة **CVD** (تراكم دلتا الحجم). الإشارة تُرفض تلقائيًا "
+           f"إذا لم تتجاوز بوابة الثقة **{BTC_CONFIDENCE_GATE:.0f}%**.")
 
-_otc_pairs_clean = [k for k in PAIRS.keys() if "OTC" not in k]
+if st.button("📊 احسب إشارة BTC", key="btn_btc", width="stretch"):
+    with st.spinner("🔄 تحليل 15m + 1H + CVD..."):
+        _d15 = get_btc_data("15m")
+        _d1h = get_btc_data("1h")
+        _btc_sig = btc_signal_15m(_d15, _d1h)
+        st.session_state.btc_result = _btc_sig
 
-_oc1, _oc2 = st.columns([1.5, 1])
-with _oc1:
-    otc_pair = st.selectbox("اختر الزوج (الأصلي — ليس OTC)",
-                            _otc_pairs_clean, index=0, key="otc_pair")
-with _oc2:
-    st.markdown('<div style="height:28px;"></div>', unsafe_allow_html=True)
-    _run_otc = st.button("📊 احسب الإشارة", key="btn_otc", width="stretch")
+_btc = st.session_state.get("btc_result")
+if _btc is not None:
+    _s = _btc["signal"]; _c = _btc["confidence"]
+    _col = "#7cd4a0" if _s == "CALL" else "#f57a7a" if _s == "PUT" else "#f5c87a"
+    _lbl = "🟢 CALL (صعود)" if _s == "CALL" else \
+           "🔴 PUT (هبوط)" if _s == "PUT" else "🟡 WAIT (لا إشارة)"
 
-if _run_otc:
-    with st.spinner("🔄 تحليل 5م / 15م / 30م..."):
-        sym = PAIRS[otc_pair]
-        _sigs = {}
-        for _tf in ["5m", "15m", "30m"]:
-            _d = get_otc_proxy_data(sym, _tf)
-            if _d is not None:
-                _sigs[_tf] = otc_direction_signal(_d)
-        st.session_state.otc_result = {
-            "combined": combine_otc_signals(_sigs),
-            "sigs": _sigs, "pair": otc_pair}
-
-_otc_res = st.session_state.get("otc_result")
-if _otc_res:
-    _cmb = _otc_res["combined"]
-    if not _cmb:
-        st.error("❌ تعذر جلب البيانات — جرب زوج آخر")
-    else:
-        _sig = _cmb["signal"]; _conf = _cmb["confidence"]
-        _color = "#7cd4a0" if _sig == "CALL" else \
-                 "#f57a7a" if _sig == "PUT" else "#f5c87a"
-        _label = "🟢 CALL / BUY" if _sig == "CALL" else \
-                 "🔴 PUT / SELL" if _sig == "PUT" else "🟡 WAIT"
-        _bp = _otc_res["pair"]
-
-        st.markdown(f"""
-        <div style="background:linear-gradient(145deg, #10141c, #0d1017);
-                    padding:28px 22px; border-radius:22px; text-align:center;
-                    border:2px solid {_color};
-                    box-shadow:0 0 30px {_color}44; margin:16px 0;">
-            <div style="color:#7d879c; font-size:0.85rem; letter-spacing:1px;">
-                ⚡ إشارة موحدة — {_bp} · 5م/15م/30م
-            </div>
-            <div style="font-size:3.2rem; font-weight:900; color:{_color};
-                        letter-spacing:3px; margin:12px 0; line-height:1;">
-                {_label}
-            </div>
-            <div style="color:#e8edf5; font-size:1.15rem;">
-                Confidence: <b>{_conf:.1f}%</b>
-            </div>
-            <div style="color:#8b95a8; font-size:0.82rem; margin-top:6px;">
-                الأصوات: CALL {_cmb['votes_call']} / PUT {_cmb['votes_put']}
-                &nbsp;·&nbsp; Call score {_cmb['call_score']}
-                · Put score {_cmb['put_score']}
-            </div>
+    st.markdown(f"""
+    <div style="background:linear-gradient(145deg, #10141c, #0d1017);
+                padding:28px 22px; border-radius:22px; text-align:center;
+                border:2px solid {_col}; box-shadow:0 0 30px {_col}44; margin:16px 0;">
+        <div style="color:#7d879c; font-size:0.85rem; letter-spacing:1px;">
+            ₿ BTC/USD — 15m Primary + 1H Filter
         </div>
-        """, unsafe_allow_html=True)
+        <div style="font-size:3rem; font-weight:900; color:{_col};
+                    letter-spacing:3px; margin:12px 0; line-height:1;">
+            {_lbl}
+        </div>
+        <div style="color:#e8edf5; font-size:1.15rem;">
+            Confidence: <b>{_c:.1f}%</b>
+        </div>
+        <div style="color:#8b95a8; font-size:0.82rem; margin-top:6px;">
+            CALL {_btc['call']} · PUT {_btc['put']} ·
+            1H: {_btc['h1_bias']} ·
+            CVD slope: {_btc['cvd_slope']:.3f}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-        st.markdown('<div class="section-title" style="font-size:1.1rem;">'
-                    '📊 تفصيل الفريمات</div>', unsafe_allow_html=True)
-        _cols = st.columns(3)
-        for i, tf in enumerate(["5m", "15m", "30m"]):
-            _s = _otc_res["sigs"].get(tf)
-            with _cols[i]:
-                if not _s:
-                    st.markdown(f'<div class="tool-card">'
-                                f'<div class="tool-name">{tf}</div>'
-                                f'<div class="tool-desc">لا بيانات</div></div>',
-                                unsafe_allow_html=True)
-                    continue
-                _sc = "#7cd4a0" if _s["signal"] == "CALL" else \
-                      "#f57a7a" if _s["signal"] == "PUT" else "#f5c87a"
-                _sl = "🟢 CALL" if _s["signal"] == "CALL" else \
-                      "🔴 PUT" if _s["signal"] == "PUT" else "🟡 WAIT"
-                _rs = " · ".join(_s.get("reasons", [])[:3]) or "لا أسباب"
-                st.markdown(f"""
-                <div style="background:linear-gradient(145deg, #0d1017, #0a0d13);
-                            padding:18px; border-radius:16px; text-align:center;
-                            border:1px solid {_sc}66;">
-                    <div style="color:#e6c87c; font-weight:800; font-size:1rem;
-                                letter-spacing:2px;">{tf}</div>
-                    <div style="color:{_sc}; font-size:1.9rem; font-weight:900;
-                                margin:8px 0; letter-spacing:2px;">{_sl}</div>
-                    <div style="color:#e8edf5; font-size:1rem;">
-                        {_s['confidence']:.1f}%</div>
-                    <div style="color:#8b95a8; font-size:0.72rem; margin-top:6px;">
-                        CALL {_s['call']} / PUT {_s['put']}</div>
-                    <div style="color:#6b7488; font-size:0.7rem; margin-top:8px;
-                                line-height:1.4;">{_rs}</div>
-                </div>
-                """, unsafe_allow_html=True)
+    if _s in ("CALL", "PUT"):
+        st.success(f"✅ إشارة معتمدة (ثقة {_c:.1f}% ≥ {BTC_CONFIDENCE_GATE:.0f}%) — "
+                   f"افتح صفقة **{_s}** على البيتكوين بمدة **15 دقيقة**.")
+        st.info(f"📌 **خطة الدخول:**\n"
+                f"- الفريم: **15m**\n"
+                f"- المدة المقترحة: **15 دقيقة**\n"
+                f"- السعر المرجعي: **{fmt_price(_btc.get('last_close', 0), 'BTC/USD')}**\n"
+                f"- 1H Bias: **{_btc['h1_bias']}** · RSI: **{_btc.get('rsi', 0):.1f}**\n"
+                f"- إدارة المخاطر: 1-2% من رأس المال لكل صفقة")
+    else:
+        st.warning(f"⏸️ **لا إشارة الآن.** الأدوات لم تتفق أو الثقة تحت "
+                   f"{BTC_CONFIDENCE_GATE:.0f}%. انتظر — عدم التداول في الضوضاء "
+                   f"هو جزء من الدقة.")
 
-        if _sig in ("CALL", "PUT"):
-            st.markdown('<div class="section-title" style="font-size:1.1rem;">'
-                        '📋 خطة الدخول</div>', unsafe_allow_html=True)
-            _best_tf = max(
-                [tf for tf in ["5m", "15m", "30m"] if _otc_res["sigs"].get(tf)],
-                key=lambda t: _otc_res["sigs"][t]["confidence"])
-            _expiry = {"5m": "5 دقائق", "15m": "15 دقيقة", "30m": "30 دقيقة"}
-            _best = _otc_res["sigs"][_best_tf]
-            _price = fmt_price(_best.get("last_close", 0), _bp)
-            st.markdown(f"""
-- **الاتجاه:** {'🟢 CALL (صعود)' if _sig == 'CALL' else '🔴 PUT (هبوط)'}
-- **الفريم الموصى به:** **{_best_tf}** (أعلى ثقة {_best['confidence']:.1f}%)
-- **مدة الصفقة المقترحة:** **{_expiry[_best_tf]}**
-- **السعر المرجعي (الزوج الأصلي):** {_price}
-- **RSI:** {_best.get('rsi', 50):.1f} · **ADX:** {_best.get('adx', 0):.1f}
-- **ملاحظة الدخول:** افتح الصفقة من البوكر عندما يكون سعر OTC قريب من السعر المرجعي، وبنفس اتجاه الإشارة
-- **إدارة المخاطر:** 1-2% من رأس المال فقط — OTC عليه مخاطرة عالية
-            """, unsafe_allow_html=True)
-        elif _sig == "WAIT":
-            st.info("⏸️ الفريمات الثلاثة غير متفقة على اتجاه واضح — انتظر إشارة أقوى.")
+    with st.expander("🔍 الأسباب التفصيلية", expanded=False):
+        for _rs in _btc.get("reasons", []):
+            st.write(f"• {_rs}")
+        st.caption(f"RSI: {_btc.get('rsi', 0):.1f} · "
+                   f"ATR Ratio: {_btc.get('atr_ratio', 0):.2f} · "
+                   f"1H Bias: {_btc.get('h1_bias', '—')} · "
+                   f"CVD Slope: {_btc.get('cvd_slope', 0):.3f}")
 
 
 # ═══════════════════════════════════════════════
@@ -3644,7 +3531,7 @@ if _otc_res:
 st.markdown(f"""
 <div class="footer-style">
     ▲ BLACK PYRAMID {APP_VERSION} ▲<br>
-    {MODE.upper()} Mode · Gate ≥ {MIN_EMIT_CONFIDENCE:.0f}% · Top {MAX_STRONG_TRADES} Trades · OTC 5m/15m/30m · Analysis Only
+    {MODE.upper()} Mode · Top {MAX_STRONG_TRADES} Trades · BTC 15m Signal · Analysis Only
 </div>
 """, unsafe_allow_html=True)
 
