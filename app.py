@@ -1,6 +1,6 @@
 # ============================================================
 # BLACK PYRAMID v2010.3 — MULTI-MODE FREQUENCY EDITION
-# Bitcoin Institutional Analysis Terminal
+# Institutional Analysis Terminal
 # ============================================================
 
 import os
@@ -52,10 +52,10 @@ warnings.filterwarnings("ignore", message=".*Expecting value.*")
 # APP CONFIG
 # ============================================================
 
-APP_VERSION = "v2011 BITCOIN ONLY"
+APP_VERSION = "v2010.7 BITCOIN TERMINAL"
 
 MODE = "balanced"
-MAX_STRONG_TRADES = 1  # Bitcoin is a single instrument
+MAX_STRONG_TRADES = 4  # عدد الصفقات القوية المعروضة
 
 _GATE_PRESETS = {
     "strict":   {"gate": 80.0, "a_plus": 85.0, "a": 80.0, "b": 72.0,
@@ -150,13 +150,16 @@ ASSET_PROFILES = {
                "swing_order": 4, "structure_lookback": 250,
                "confidence_threshold": 76, "confirmation_threshold": 70}}
 
-PAIRS = {
-    "BTC/USD (Bitcoin)": "BTC-USD"
-}
+PAIRS = {"BTC/USD (Bitcoin)": "BTC-USD"}
 
 YF_SYMBOL_ALTERNATIVES = {
-    "BTC-USD": ["BTC-USD"]
-}
+    "GC=F": ["GC=F", "XAUUSD=X", "GLD"], "SI=F": ["SI=F", "XAGUSD=X", "SLV"],
+    "DX-Y.NYB": ["DX=F", "DX-Y.NYB", "UUP"],
+    "BTC-USD": ["BTC-USD", "BTC=F"], "ETH-USD": ["ETH-USD", "ETH=F"],
+    "EURUSD=X": ["EURUSD=X", "EUR=F"], "GBPUSD=X": ["GBPUSD=X", "GBP=F"],
+    "USDJPY=X": ["USDJPY=X", "JPY=F"], "AUDUSD=X": ["AUDUSD=X", "AUD=F"],
+    "USDCAD=X": ["USDCAD=X", "CAD=F"], "USDCHF=X": ["USDCHF=X", "CHF=F"],
+    "NZDUSD=X": ["NZDUSD=X", "NZD=F"], "^VIX": ["^VIX", "VIXY", "VXX"]}
 
 KILL_ZONES = {"London Open": (7, 10), "NY Open": (12, 15), "London Close": (15, 17)}
 
@@ -188,8 +191,13 @@ RISK_ON_CURRENCIES = {"AUD", "NZD", "CAD"}
 # API credentials supplied for this local build. These are fallbacks only:
 # Streamlit Secrets / environment variables take precedence. Rotate these keys
 # before deployment because credentials pasted into a chat should be considered exposed.
-_EMBEDDED_API_KEYS = {}  # Configure API keys via Streamlit Secrets or environment variables.
-
+_EMBEDDED_API_KEYS = {
+    # Keep credentials out of source files. Configure optional keys via
+    # Streamlit Secrets or environment variables; Yahoo Finance remains fallback.
+    "FMP_API_KEY": "",
+    "TWELVE_API_KEY": "",
+    "TWELVE_DATA_API_KEY": "",
+}
 
 def get_secret(name, default=""):
     try:
@@ -1536,11 +1544,7 @@ def get_fundamental_score(pair_name, ccy_strength=None, rate_diff=0.0,
         elif rate_diff < -1.0: sb += 10
     if risk and risk.get("bias_impact", 0) != 0:
         det.append({"factor": "Risk Sentiment", "mode": risk["risk_mode"]})
-        if b == "BTC":
-            # Broad risk appetite is contextual evidence only, never a trade trigger.
-            if risk["risk_mode"] == "RISK-ON": bb += 8
-            elif risk["risk_mode"] == "RISK-OFF": sb += 8
-        elif risk["risk_mode"] == "RISK-OFF":
+        if risk["risk_mode"] == "RISK-OFF":
             if b in RISK_OFF_CURRENCIES and q not in RISK_OFF_CURRENCIES: bb += 12
             elif q in RISK_OFF_CURRENCIES and b not in RISK_OFF_CURRENCIES: sb += 12
         elif risk["risk_mode"] == "RISK-ON":
@@ -2337,10 +2341,9 @@ def generate_signal(df, current_price, pair_name, symbol,
         wk, _ = weekly_bias(symbol, pair_name)
         dxy, _, _ = get_dxy_context()
         gc = get_gold_dxy_correlation() if ("Gold" in pair_name or "XAU" in pair_name.upper()) else None
-        # BTC/USD has no fiat base-currency strength or policy-rate differential.
-        ccs = {}
+        ccs = get_currency_strength_matrix()
         st.session_state["_ccy_strength_cache"] = ccs
-        rd = 0.0
+        rd, _ = get_interest_rate_differential(pair_name)
         rk = get_risk_sentiment(); bd = get_bond_yields(); sent = None
     else:
         mtf = precomputed.get("mtf_bias","NEUTRAL"); mtfc = precomputed.get("mtf_conf", 50.0)
@@ -3027,327 +3030,211 @@ def render_trade_plan(levels, pair_name, title="Trade Plan", accent="#e6c87c",
 
 
 # ============================================================
-# UI
+# BITCOIN-ONLY TERMINAL UI
 # ============================================================
 
-st.set_page_config(page_title=f"BLACK PYRAMID {APP_VERSION}",
-                   page_icon="▲", layout="wide")
+st.set_page_config(page_title=f"BLACK PYRAMID · BTC {APP_VERSION}",
+                   page_icon="₿", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
-html, body, [class*="css"] { font-family: 'Inter','Segoe UI',Tahoma,sans-serif; }
-body { background: #0a0d13; color: #e8edf5; }
-.main-header, .main-title, .main-subtitle,
-.metric-card, .metric-label, .metric-value, .metric-sub,
-.tool-card, .tool-name, .tool-value, .tool-desc,
-.section-title, .footer-style,
-div[data-testid="stMetric"] label, div[data-testid="stMetric"] .stMetricValue,
-div[data-testid="stDataFrame"] th, div[data-testid="stDataFrame"] td { direction: rtl; }
-[data-testid="collapsedControl"], [data-testid="stSidebarCollapsedControl"],
-button[kind="header"] { position: fixed !important; left: 12px !important;
-    right: auto !important; top: 14px !important; z-index: 999999 !important;
-    background: rgba(230,200,124,0.08) !important;
-    border: 1px solid rgba(230,200,124,0.25) !important;
-    border-radius: 50% !important; width: 40px !important; height: 40px !important;
-    display: flex !important; align-items: center !important;
-    justify-content: center !important; transition: all 0.25s ease !important; }
-[data-testid="collapsedControl"]:hover, [data-testid="stSidebarCollapsedControl"]:hover,
-button[kind="header"]:hover { background: rgba(230,200,124,0.2) !important;
-    border-color: rgba(230,200,124,0.6) !important; transform: scale(1.05) !important; }
-[data-testid="stSidebar"] { direction: rtl; }
-[data-testid="stSidebar"] > div:first-child { direction: rtl; }
-.hero { background: radial-gradient(circle at 20% 30%, rgba(230,200,124,0.08), transparent 60%),
-    radial-gradient(circle at 80% 70%, rgba(124,212,160,0.06), transparent 60%),
-    linear-gradient(145deg, #10141c, #0d1017);
-    padding: 18px 26px; border-radius: 20px;
-    border: 1px solid rgba(230,200,124,0.12);
-    box-shadow: 0 12px 30px rgba(0,0,0,0.55);
-    position: relative; overflow: hidden; }
-.hero::before { content:''; position:absolute; top:0; left:0; right:0; height:3px;
-    background: linear-gradient(90deg, transparent, #e6c87c, #7cd4a0, #e6c87c, transparent); }
-.hero-title { font-size: 2rem; font-weight: 800; color: #e6c87c;
-    letter-spacing: 3px; margin: 0; line-height: 1.1;
-    text-shadow: 0 0 30px rgba(230,200,124,0.35); }
-.hero-sub { color: #8b95a8; margin-top: 8px; font-size: 0.82rem;
-    font-weight: 300; letter-spacing: 0.3px; line-height: 1.4; }
-.hero-badge { display: inline-block; padding: 3px 12px; border-radius: 40px;
-    background: rgba(230,200,124,0.1); color: #e6c87c; font-size: 0.7rem;
-    font-weight: 600; border: 1px solid rgba(230,200,124,0.25);
-    margin-left: 6px; letter-spacing: 1px; }
-.hero-badge-gate { display: inline-block; padding: 3px 12px;
-    border-radius: 40px; background: rgba(124,212,160,0.15); color: #7cd4a0;
-    font-size: 0.7rem; font-weight: 700;
-    border: 1px solid rgba(124,212,160,0.5);
-    margin-left: 6px; letter-spacing: 1.5px; }
-.hero-badge-mode { display: inline-block; padding: 3px 12px;
-    border-radius: 40px; background: rgba(230,200,124,0.2); color: #e6c87c;
-    font-size: 0.7rem; font-weight: 700;
-    border: 1px solid rgba(230,200,124,0.6);
-    margin-left: 6px; letter-spacing: 1.5px; text-transform: uppercase; }
-.section-title { font-size: 1.4rem; font-weight: 700; color: #e6c87c;
-    margin: 32px 0 18px 0; padding-bottom: 12px;
-    border-bottom: 1px solid rgba(230,200,124,0.15); }
-.section-title span { color: #6b7488; font-size: 0.85rem; font-weight: 400; }
-.tool-card { background: linear-gradient(145deg, #10141c, #0d1017);
-    padding: 20px; border-radius: 16px;
-    border: 1px solid rgba(255,255,255,0.05);
-    box-shadow: 0 6px 16px rgba(0,0,0,0.35);
-    transition: all 0.25s ease; height: 100%; }
-.tool-card:hover { border-color: rgba(230,200,124,0.3); transform: translateY(-3px);
-    box-shadow: 0 12px 28px rgba(0,0,0,0.5); }
-.tool-name { color: #e6c87c; font-size: 0.85rem; font-weight: 700;
-    letter-spacing: 1px; text-transform: uppercase; margin-bottom: 10px; }
-.tool-value { color: #e8edf5; font-size: 1.3rem; font-weight: 700; }
-.tool-desc { color: #8892a5; font-size: 0.82rem; margin-top: 8px; line-height: 1.5; }
-div.stButton > button { background: linear-gradient(145deg, #1a2130, #131821);
-    color: #e8edf5; border: 1px solid rgba(230,200,124,0.2);
-    border-radius: 40px; padding: 0.7rem 1.8rem; font-weight: 500;
-    letter-spacing: 0.3px; transition: all 0.25s ease;
-    box-shadow: 0 6px 16px rgba(0,0,0,0.4); width: 100%; }
-div.stButton > button:hover { background: linear-gradient(145deg, #263049, #1a2233);
-    border-color: rgba(230,200,124,0.55); color: #fff;
-    transform: translateY(-1px); box-shadow: 0 10px 24px rgba(0,0,0,0.6); }
-div[data-testid="stMetric"] { background: linear-gradient(145deg, #10141c, #0d1017);
-    padding: 16px 18px; border-radius: 16px;
-    border: 1px solid rgba(255,255,255,0.05); }
-div[data-testid="stMetric"] label { color: #7d879c !important;
-    font-size: 0.78rem !important; text-transform: uppercase;
-    letter-spacing: 1px; font-weight: 600; }
-div[data-testid="stMetric"] .stMetricValue { color: #e8edf5 !important;
-    font-weight: 700 !important; }
-div[data-testid="stTextInput"] > label { color: #e6c87c !important;
-    font-weight: 600 !important; font-size: 0.85rem !important;
-    letter-spacing: 0.5px; }
-div[data-testid="stTextInput"] > div > div > input {
-    background: linear-gradient(145deg, #10141c, #0d1017) !important;
-    border: 1px solid rgba(230,200,124,0.25) !important;
-    border-radius: 12px !important; color: #e8edf5 !important;
-    padding: 10px 14px !important; }
-div[data-testid="stTextInput"] > div > div > input:focus {
-    border-color: rgba(230,200,124,0.55) !important;
-    box-shadow: 0 0 0 2px rgba(230,200,124,0.15) !important; }
-hr { border: none; height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(230,200,124,0.15), transparent);
-    margin: 30px 0; }
-.footer-style { text-align: center; color: #4a5266; padding: 40px 0 20px;
-    border-top: 1px solid rgba(255,255,255,0.04);
-    margin-top: 40px; font-size: 0.85rem; letter-spacing: 0.5px; }
-details { background: #0d1017 !important; border-radius: 16px !important;
-    border: 1px solid rgba(255,255,255,0.05) !important; }
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+:root { color-scheme: dark; }
+html, body, [class*="css"] { font-family: Inter, 'Segoe UI', sans-serif; }
+.stApp { background: radial-gradient(ellipse at 82% 0%, #14243a 0%, #0a101b 42%, #080c14 100%); color:#edf3fb; }
+.block-container { max-width: 1500px; padding-top: 1.5rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { background:linear-gradient(180deg,#101a2a,#0b111c); border-right:1px solid #24334a; }
+[data-testid="stSidebar"] * { color:#dce6f4; }
+.hero { padding:26px 30px; border:1px solid #293c56; border-radius:24px;
+ background:linear-gradient(115deg,rgba(24,42,65,.96),rgba(12,20,33,.96));
+ box-shadow:0 18px 55px #0006; position:relative; overflow:hidden; }
+.hero:after { content:'₿'; position:absolute; right:35px; top:-28px; font-size:180px; font-weight:900; color:#f7931a12; }
+.eyebrow { color:#f5a623; font-size:.75rem; letter-spacing:3px; font-weight:800; }
+.hero h1 { margin:8px 0 5px; font-size:2.1rem; font-weight:900; color:#f4f7fc; }
+.hero p { color:#93a7c1; margin:0; }
+.panel { background:linear-gradient(145deg,#121e2e,#0d1623); border:1px solid #25364d; border-radius:19px; padding:18px 20px; }
+.panel-title { color:#9db2cb; font-size:.78rem; letter-spacing:1.4px; font-weight:800; margin-bottom:10px; }
+.big-number { font-size:1.7rem; font-weight:850; color:#f2f6fc; }
+.muted { color:#8397b1; font-size:.82rem; }
+.section-heading { font-size:1.22rem; font-weight:850; color:#f1f5fb; margin:28px 0 12px; }
+.pill { display:inline-block; padding:5px 11px; border-radius:20px; font-size:.76rem; font-weight:800; background:#1c2c40; color:#b9cce2; border:1px solid #344b66; }
+div.stButton>button { border-radius:13px; min-height:46px; font-weight:800; border:1px solid #405873; background:linear-gradient(135deg,#1b3049,#142337); color:#f4f7fc; }
+div.stButton>button[kind="primary"] { background:linear-gradient(135deg,#f6a623,#dc8110); color:#101722; border:0; }
+div[data-testid="stMetric"] { background:#111d2b; border:1px solid #263a52; border-radius:15px; padding:14px; }
+div[data-testid="stMetricLabel"] { color:#91a7c1; }
+hr { border-color:#26384e; }
+footer {visibility:hidden;}
 </style>
 """, unsafe_allow_html=True)
 
+BTC_PAIR = "BTC/USD (Bitcoin)"
+BTC_SYMBOL = "BTC-USD"
 
-# ═══════════════════════════════════════════════
-# HERO
-# ═══════════════════════════════════════════════
-_logo = load_logo_b64()
-hl, hr = st.columns([1.15, 1.6])
-with hl:
-    if _logo:
-        st.markdown(f"""
-        <div class="hero">
-            <img src="data:image/png;base64,{_logo}" alt="BP"
-                 style="width: 190px; max-width: 100%; height: auto;
-                        display: block; filter: drop-shadow(0 6px 20px rgba(230,200,124,0.3));">
-            <div class="hero-sub" style="margin-top: 8px;">
-                Bitcoin Institutional Analysis Terminal
-                <span class="hero-badge">{APP_VERSION}</span>
-                <span class="hero-badge-mode">{MODE.upper()}</span>
-                <span class="hero-badge-gate">GATE ≥ {MIN_EMIT_CONFIDENCE:.0f}%</span>
-            </div>
-        </div>""", unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="hero">
-            <div class="hero-title">▲ BLACK PYRAMID</div>
-            <div class="hero-sub" style="margin-top: 8px;">
-                Bitcoin Institutional Analysis Terminal
-                <span class="hero-badge">{APP_VERSION}</span>
-                <span class="hero-badge-mode">{MODE.upper()}</span>
-                <span class="hero-badge-gate">GATE ≥ {MIN_EMIT_CONFIDENCE:.0f}%</span>
-            </div>
-        </div>""", unsafe_allow_html=True)
+# Sidebar: deliberately fixed to Bitcoin; no multi-asset selector remains.
+with st.sidebar:
+    st.markdown("## ₿ BLACK PYRAMID")
+    st.caption("BITCOIN MARKET INTELLIGENCE")
+    st.markdown('<span class="pill">BTC / USD ONLY</span>', unsafe_allow_html=True)
+    st.divider()
+    st.markdown("**محركات التحليل**")
+    st.caption("السعر · الاتجاه · الزخم · الحجم · هيكل السوق · السيولة · تعدد الأطر الزمنية")
+    st.divider()
+    st.markdown("**الأطر الزمنية**")
+    st.write("⚡ قصير المدى: 15 دقيقة")
+    st.write("📈 متوسط المدى: 4 ساعات")
+    st.divider()
+    st.caption(f"{APP_VERSION} · Analysis only")
 
-with hr:
-    st.markdown('<div style="height: 32px;"></div>', unsafe_allow_html=True)
-    br = st.columns([1, 1])
-    with br[0]:
-        if st.button("🔄 تحديث", width="stretch", key="btn_ref"):
-            st.session_state.economic_events = get_fmp_economic_calendar()
-            st.cache_data.clear()
-            st.toast("✅ تم التحديث")
-    with br[1]:
-        if st.button(f"🎯 أعثر على {MAX_STRONG_TRADES} صفقات قوية", width="stretch", key="btn_strong"):
-            with st.spinner(f"🔍 جاري البحث عن أفضل {MAX_STRONG_TRADES} صفقات..."):
-                st.session_state.strong_trade_result = find_strongest_trades(
-                    max_trades=MAX_STRONG_TRADES)
-            st.rerun()
-
-
-# ═══════════════════════════════════════════════
-# API KEYS SECTION
-# ═══════════════════════════════════════════════
-st.markdown('<div class="section-title">🔑 مفاتيح المصادر <span>API Keys · Data Sources</span></div>',
-            unsafe_allow_html=True)
-st.caption("مفاتيح FMP وTwelve Data مضمنة كإعداد افتراضي لهذه النسخة؛ يمكنك استبدالها هنا للجلسة الحالية أو ضبط Streamlit Secrets للنشر الآمن.")
-
-if "_td_api_input" not in st.session_state:
-    st.session_state._td_api_input = get_secret("TWELVE_API_KEY", "")
-if "_fmp_api_input" not in st.session_state:
-    st.session_state._fmp_api_input = get_secret("FMP_API_KEY", "")
-
-kc1, kc2 = st.columns(2)
-with kc1:
-    td_val = st.text_input(
-        "TwelveData API Key",
-        type="password",
-        key="_td_api_input",
-        placeholder="مفتاح TwelveData للأسعار",
-        help="بديل مجاني: yfinance (مدمج). TwelveData مصدر بديل لبيانات BTC/USD.")
-    _td_status = "✅ نشط" if td_val else "⚪ غير مفعّل (يستخدم yfinance)"
-    st.caption(f"الحالة: {_td_status}")
-
-with kc2:
-    fmp_val = st.text_input(
-        "FMP API Key",
-        type="password",
-        key="_fmp_api_input",
-        placeholder="مفتاح Financial Modeling Prep للتقويم",
-        help="يُستخدم لجلب أحداث الدولار الأمريكي ذات الصلة بسوق Bitcoin.")
-    _fmp_status = "✅ نشط" if fmp_val else "⚪ غير مفعّل"
-    st.caption(f"الحالة: {_fmp_status}")
-
-_changed = False
-if td_val != st.session_state.get("TWELVE_API_KEY", ""):
-    st.session_state.TWELVE_API_KEY = td_val
-    _changed = True
-if fmp_val != st.session_state.get("FMP_API_KEY", ""):
-    st.session_state.FMP_API_KEY = fmp_val
-    _changed = True
-if _changed:
-    st.cache_data.clear()
-
-
-# ═══════════════════════════════════════════════
-# STRONGEST TRADES DISPLAY (up to 4)
-# ═══════════════════════════════════════════════
-_str_res = st.session_state.get("strong_trade_result")
-
-if _str_res:
-    if _str_res.get("status") == "NONE":
-        st.markdown('<div class="section-title">🏆 الصفقات القوية</div>',
-                    unsafe_allow_html=True)
-        st.warning("⏸️ **لا توجد صفقات قوية تمر البوابة الآن.** "
-                   f"(تحتاج ≥ {MIN_EMIT_CONFIDENCE:.0f}% ثقة + تأكيد)")
-
-    elif _str_res.get("status") == "FOUND":
-        _trades = _str_res.get("trades", [])
-        _n = len(_trades)
-
-        st.markdown(
-            f'<div class="section-title" style="color:#7cd4a0;">'
-            f'🏆 أقوى {_n} {"صفقة" if _n == 1 else "صفقات"} في السوق الآن '
-            f'<span>مرتبة حسب القوة · بوابة {MIN_EMIT_CONFIDENCE:.0f}%</span></div>',
-            unsafe_allow_html=True)
-
-        for idx, t in enumerate(_trades, 1):
-            _bp = t["pair"]; _br = t["result"]; _blv = _br["levels"]
-            _bsig = _br["signal"]; _bc = _br["confidence"]
-            _bprice = t["price"]; _ec = t.get("ec")
-            _bacc = "#7cd4a0" if _bsig == "BUY" else "#f57a7a"
-            _rank_icon = {1: "🥇", 2: "🥈", 3: "🥉"}.get(idx, f"#{idx}")
-
-            st.markdown(
-                f'<div style="margin:24px 0 14px 0; padding:12px 18px; '
-                f'background:linear-gradient(90deg, {_bacc}22, transparent); '
-                f'border-left:4px solid {_bacc}; border-radius:10px;">'
-                f'<span style="color:{_bacc}; font-size:1.15rem; font-weight:800;">'
-                f'{_rank_icon} صفقة #{idx}</span>'
-                f'<span style="color:#e8edf5; font-size:1.15rem; font-weight:700; '
-                f'margin:0 10px;">— {_bp}</span>'
-                f'<span style="color:{_bacc}; font-size:1.1rem; font-weight:800;">'
-                f'· {_bsig} · {_bc:.1f}% · {_br["trade_grade"]}</span>'
-                f'</div>',
-                unsafe_allow_html=True)
-
-            _bs1, _bs2 = st.columns([1.4, 1.2])
-            with _bs1:
-                st.markdown(f"""
-                <div style="background:linear-gradient(145deg, #0a1a12, #0d1710);
-                            padding:22px 18px; border-radius:20px; text-align:center;
-                            border:2px solid {_bacc};
-                            box-shadow:0 0 25px {_bacc}44, 0 12px 30px rgba(0,0,0,0.6);">
-                    <div style="color:#7cd4a0; font-size:0.75rem; font-weight:800;
-                                letter-spacing:2px;">{_rank_icon} RANK #{idx}</div>
-                    <div style="color:#e8edf5; font-size:1.15rem; font-weight:800;
-                                margin-top:6px;">{_bp}</div>
-                    <div style="font-size:2.8rem; font-weight:900; color:{_bacc};
-                                letter-spacing:3px; margin:8px 0; line-height:1;">
-                        {_bsig}</div>
-                    <div style="color:#c8d2e2; font-size:1rem;">
-                        Confidence: <b>{_bc:.1f}%</b></div>
-                    <div style="color:{_bacc}; font-size:1rem; font-weight:800;
-                                margin-top:6px; letter-spacing:1.5px;">
-                        Grade: {_br['trade_grade']}</div>
-                </div>""", unsafe_allow_html=True)
-
-            with _bs2:
-                st.metric("💵 السعر", fmt_price(_bprice, _bp))
-                if _blv:
-                    st.metric("🛑 SL", fmt_price(_blv["stop_loss"], _bp),
-                              help=_blv.get("sources", {}).get("sl", ""))
-                    st.metric("🎯 TP1", fmt_price(_blv["target1"], _bp),
-                              help=_blv.get("sources", {}).get("tp1", ""))
-                    st.metric("🎯 TP2", fmt_price(_blv["target2"], _bp),
-                              help=_blv.get("sources", {}).get("tp2", ""))
-                    st.metric("🎯 TP3", fmt_price(_blv["target3"], _bp),
-                              help=_blv.get("sources", {}).get("tp3", ""))
-
-            if _blv:
-                _rr1 = _blv["risk_reward_1"]; _rr2 = _blv["risk_reward_2"]
-                _rr3 = _blv["risk_reward_3"]
-                _src = _blv.get("sources", {})
-                st.markdown(
-                    f'<div style="margin-top:10px; display:flex; gap:6px; flex-wrap:wrap;">'
-                    f'<span style="background:rgba(245,122,122,0.15); padding:5px 12px; '
-                    f'border-radius:16px; color:#f57a7a; font-size:0.78rem; '
-                    f'border:1px solid rgba(245,122,122,0.35); font-weight:600;">'
-                    f'🛑 SL: {_src.get("sl","—")}</span>'
-                    f'<span style="background:rgba(230,200,124,0.15); padding:5px 12px; '
-                    f'border-radius:16px; color:#e6c87c; font-size:0.78rem; '
-                    f'border:1px solid rgba(230,200,124,0.35);">'
-                    f'RR1 1:{_rr1:.2f}</span>'
-                    f'<span style="background:rgba(124,212,160,0.12); padding:5px 12px; '
-                    f'border-radius:16px; color:#7cd4a0; font-size:0.78rem; '
-                    f'border:1px solid rgba(124,212,160,0.35);">'
-                    f'RR2 1:{_rr2:.2f}</span>'
-                    f'<span style="background:rgba(124,212,160,0.12); padding:5px 12px; '
-                    f'border-radius:16px; color:#7cd4a0; font-size:0.78rem; '
-                    f'border:1px solid rgba(124,212,160,0.35);">'
-                    f'RR3 1:{_rr3:.2f}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True)
-
-            st.markdown("---")
-
-else:
-    st.markdown('<div class="section-title">🏆 الصفقات القوية</div>',
-                unsafe_allow_html=True)
-    st.info(f"🎯 اضغط **'أعثر على {MAX_STRONG_TRADES} صفقات قوية'** أعلاه لبدء البحث "
-            f"على BTC/USD فقط. سيتم عرض أفضل {MAX_STRONG_TRADES} "
-            f"إشارات تمر البوابة ≥ {MIN_EMIT_CONFIDENCE:.0f}%.")
-
-
-# ═══════════════════════════════════════════════
-# FOOTER + STOP
-# ═══════════════════════════════════════════════
-st.markdown(f"""
-<div class="footer-style">
-    ▲ BLACK PYRAMID {APP_VERSION} ▲<br>
-    {MODE.upper()} Mode · Gate ≥ {MIN_EMIT_CONFIDENCE:.0f}% · Top {MAX_STRONG_TRADES} Trades · Analysis Only
+# Top-level market identity and controls.
+st.markdown("""
+<div class="hero">
+  <div class="eyebrow">BLACK PYRAMID · DIGITAL ASSET TERMINAL</div>
+  <h1>Bitcoin Intelligence</h1>
+  <p>منصة تحليل فني متخصصة في البيتكوين — قراءة السوق وفرص قصيرة ومتوسطة المدى</p>
 </div>
 """, unsafe_allow_html=True)
 
-st.stop()
+ctl1, ctl2, ctl3 = st.columns([1.15,1.15,3.7])
+with ctl1:
+    refresh_clicked = st.button("↻ تحديث البيانات", use_container_width=True, key="btc_refresh")
+with ctl2:
+    analyze_clicked = st.button("⌁ تحليل البيتكوين", type="primary", use_container_width=True, key="btc_analyze")
+with ctl3:
+    st.markdown('<div style="padding:12px 4px;color:#8298b4;font-size:.85rem">مصدر الأسعار: Yahoo Finance مع Twelve Data كمسار احتياطي عند توافر المفتاح. الأرقام المعروضة تعتمد على آخر بيانات تم جلبها بنجاح.</div>', unsafe_allow_html=True)
+
+if refresh_clicked:
+    st.cache_data.clear()
+    st.session_state.pop("btc_short_result", None)
+    st.session_state.pop("btc_medium_result", None)
+    st.session_state.pop("btc_market_snapshot", None)
+    st.toast("تم مسح التخزين المؤقت — جاري إعادة تحميل بيانات البيتكوين")
+    st.rerun()
+
+@st.cache_data(ttl=45, show_spinner=False)
+def btc_market_snapshot():
+    price, change = get_spot_price(BTC_SYMBOL)
+    daily = get_historical_data(BTC_SYMBOL, "3mo", "1d")
+    hourly = get_historical_data(BTC_SYMBOL, "5d", "1h")
+    if daily is None or len(daily) < 2:
+        raise RuntimeError("تعذر جلب بيانات البيتكوين اليومية من مزود البيانات")
+    last = daily.iloc[-1]
+    prev = daily.iloc[-2]
+    day_change = ((float(last.close)-float(prev.close))/float(prev.close)*100) if float(prev.close) else 0.0
+    if price is None:
+        price = float(last.close)
+        quote_label = "آخر إغلاق يومي — السعر المباشر غير متاح"
+    else:
+        quote_label = "آخر سعر متاح من مزود البيانات"
+    volume = float(last.volume) if np.isfinite(last.volume) else 0.0
+    atr = safe_float(calc_atr(daily).iloc[-1], np.nan)
+    return {"price":float(price),"change":float(change if change is not None else day_change),
+            "day_change":float(day_change),"volume":volume,"high":float(last.high),
+            "low":float(last.low),"atr":atr,"daily":daily,"hourly":hourly,
+            "quote_label":quote_label,"updated":datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+def analyze_btc_timeframe(period, interval, label):
+    data = get_historical_data(BTC_SYMBOL, period, interval)
+    if data is None or len(data) < 100:
+        raise RuntimeError(f"بيانات {label} غير كافية للتحليل (المتاح أقل من 100 شمعة)")
+    price, _ = get_spot_price(BTC_SYMBOL)
+    if price is None:
+        price = float(data.close.iloc[-1])
+    result = generate_signal(data, float(price), BTC_PAIR, BTC_SYMBOL,
+                             skip_external_filters=False)
+    return {"label":label,"result":result,"data":result.get("df",data),"price":float(price),
+            "bars":len(data),"interval":interval}
+
+def render_btc_opportunity(item, title):
+    r = item["result"]
+    sig = r.get("signal", "WAIT")
+    conf = safe_float(r.get("confidence"), 0)
+    grade = r.get("trade_grade", "WAIT")
+    color = "#35c98b" if sig == "BUY" else "#ff6878" if sig == "SELL" else "#f4b544"
+    status = r.get("execution_status", "WAIT")
+    st.markdown(f'<div class="section-heading">{title}</div>', unsafe_allow_html=True)
+    a,b,c,d = st.columns([1.2,1,1,1])
+    with a:
+        st.markdown(f'<div class="panel"><div class="panel-title">الاتجاه المقترح</div><div style="font-size:2rem;font-weight:900;color:{color}">{sig}</div><div class="muted">{grade} · {status}</div></div>', unsafe_allow_html=True)
+    b.metric("قوة الإشارة", f"{conf:.1f}%")
+    c.metric("BUY Score", f"{safe_float(r.get('buy_score'),0):.1f}")
+    d.metric("SELL Score", f"{safe_float(r.get('sell_score'),0):.1f}")
+    st.caption(f"السعر المرجعي: {fmt_price(item['price'], BTC_PAIR)} · الشموع المستخدمة: {item['bars']} · الإطار: {item['interval']}")
+    lv = r.get("levels")
+    if lv:
+        p1,p2,p3,p4,p5 = st.columns(5)
+        p1.metric("الدخول", fmt_price(lv.get("entry"), BTC_PAIR))
+        p2.metric("وقف الخسارة", fmt_price(lv.get("stop_loss"), BTC_PAIR))
+        p3.metric("الهدف الأول", fmt_price(lv.get("target1"), BTC_PAIR))
+        p4.metric("الهدف الثاني", fmt_price(lv.get("target2"), BTC_PAIR))
+        p5.metric("الهدف الثالث", fmt_price(lv.get("target3"), BTC_PAIR))
+        st.caption(f"Risk/Reward: TP1 1:{safe_float(lv.get('risk_reward_1'),0):.2f} · TP2 1:{safe_float(lv.get('risk_reward_2'),0):.2f} · TP3 1:{safe_float(lv.get('risk_reward_3'),0):.2f}")
+    else:
+        st.info("لا توجد مستويات دخول ووقف وأهداف صالحة حاليًا؛ الإشارة للمتابعة فقط وليست أمر تداول.")
+    st.markdown(f"**حالة التنفيذ:** {r.get('execution_reason','—')}")
+    with st.expander("تفاصيل التحليل والفلاتر"):
+        st.write({"MTF":r.get("mtf_bias"),"Weekly":r.get("weekly_bias"),
+                  "Regime":r.get("regime"),"Confirmation":r.get("confirmation_score"),
+                  "Entry confirmation":r.get("entry_confirmation_score"),
+                  "Divergence":r.get("divergence"),"Reasons":r.get("reasons",[]),
+                  "Block reason":r.get("filter_block_reason")})
+
+# Load snapshot on first visit and after explicit refresh.
+try:
+    with st.spinner("جاري تحميل بيانات البيتكوين..."):
+        snap = btc_market_snapshot()
+    st.session_state.btc_market_snapshot = snap
+except Exception as exc:
+    snap = st.session_state.get("btc_market_snapshot")
+    st.error(f"تعذر تحديث بيانات السوق: {exc}")
+
+if snap:
+    st.markdown('<div class="section-heading">نظرة عامة على سوق البيتكوين</div>', unsafe_allow_html=True)
+    m1,m2,m3,m4,m5 = st.columns([1.5,1,1,1,1])
+    m1.metric("BTC / USD", f"${snap['price']:,.2f}", f"{snap['change']:+.2f}%")
+    m2.metric("تغير اليوم", f"{snap['day_change']:+.2f}%")
+    m3.metric("أعلى اليوم", f"${snap['high']:,.2f}")
+    m4.metric("أدنى اليوم", f"${snap['low']:,.2f}")
+    m5.metric("ATR · يومي", f"${snap['atr']:,.2f}" if np.isfinite(snap['atr']) else "—")
+    st.caption(f"{snap['quote_label']} · آخر تحديث: {snap['updated']} · حجم التداول اليومي من الشمعة اليومية: {snap['volume']:,.0f}")
+
+    # Price chart based on recent hourly candles.
+    chart_data = snap.get("hourly")
+    if chart_data is not None and len(chart_data) > 5:
+        st.markdown('<div class="section-heading">حركة السعر — آخر 5 أيام</div>', unsafe_allow_html=True)
+        fig = go.Figure(data=[go.Candlestick(x=chart_data.index, open=chart_data.open,
+            high=chart_data.high, low=chart_data.low, close=chart_data.close,
+            increasing_line_color="#28c98b", decreasing_line_color="#ff6878",
+            increasing_fillcolor="#28c98b", decreasing_fillcolor="#ff6878")])
+        fig.update_layout(template="plotly_dark", height=390, margin=dict(l=10,r=10,t=15,b=10),
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            xaxis_rangeslider_visible=False, font=dict(color="#b9cbe0"),
+            yaxis_title="USD", xaxis_title="")
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar":False})
+
+if analyze_clicked:
+    st.session_state.btc_short_result = None
+    st.session_state.btc_medium_result = None
+    try:
+        with st.spinner("جارٍ تحليل البيتكوين على المدى القصير والمتوسط باستخدام محرك BLACK PYRAMID..."):
+            st.session_state.btc_short_result = analyze_btc_timeframe("60d", "15m", "قصير المدى")
+            st.session_state.btc_medium_result = analyze_btc_timeframe("1y", "4h", "متوسط المدى")
+        st.session_state.btc_analysis_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.toast("اكتمل تحليل البيتكوين")
+    except Exception as exc:
+        st.error(f"حدث خطأ أثناء التحليل: {exc}")
+
+short_item = st.session_state.get("btc_short_result")
+medium_item = st.session_state.get("btc_medium_result")
+if short_item or medium_item:
+    st.markdown('<div class="section-heading">فرص التداول المكتشفة</div>', unsafe_allow_html=True)
+    if short_item:
+        render_btc_opportunity(short_item, "⚡ فرص المدى القصير · 15 دقيقة")
+        st.divider()
+    if medium_item:
+        render_btc_opportunity(medium_item, "📈 فرص المدى المتوسط · 4 ساعات")
+    st.caption(f"آخر تحليل: {st.session_state.get('btc_analysis_time','—')}")
+else:
+    st.markdown('<div class="section-heading">فرص التداول</div>', unsafe_allow_html=True)
+    st.info("اضغط «تحليل البيتكوين» لعرض فرص المدى القصير والمتوسط. قد تكون النتيجة WAIT إذا لم تستوفِ السوق شروط الدخول — لا يتم اختلاق صفقات عند غياب التأكيد.")
+
+st.markdown("<hr><div style='text-align:center;color:#637992;font-size:.78rem;padding:12px'>BLACK PYRAMID · BITCOIN ONLY · التحليل أداة مساعدة وليس ضمانًا للربح أو توصية استثمارية</div>", unsafe_allow_html=True)
